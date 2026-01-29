@@ -4,7 +4,6 @@ import re
 from dataclasses import dataclass
 from typing import List
 
-
 _HERO_HEADER_STOP = {
     "изменения",
     "источник",
@@ -81,6 +80,24 @@ def _split_long_text(text: str, max_chars: int) -> List[str]:
         out.append(t[i:j].strip())
         i = j
     return [x for x in out if x]
+
+
+def chunk_hero_card(text: str) -> List[str]:
+    """
+    Чанкинг для карточек героев из HTML.
+    Каждого героя оставляем как один цельный чанк.
+    """
+    if not text:
+        return []
+
+    # Убираем лишние пробелы, но сохраняем структуру
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    if not lines:
+        return []
+
+    # Объединяем все строки в один чанк
+    full_text = "\n".join(lines)
+    return [full_text]
 
 
 def chunk_heroes_by_headers(page_text: str, max_chars: int = 1200) -> List[str]:

@@ -11,6 +11,7 @@ from src.chunking.chunker import ChunkerConfig, chunk_text
 from src.embed.embedder import Embedder, EmbedderConfig
 from src.ingest.heroes_html_ingest import extract_hero_docs_from_html
 from src.chunking.chunker import _split_long_text  # или сделай публичную split-функцию
+from src.chunking.chunker import chunk_hero_card
 
 RAW_DIR = Path("data/raw")
 INDEX_DIR = Path("index")
@@ -64,50 +65,36 @@ def main() -> None:
                 raise FileNotFoundError(f"Missing {html_path}. Put heroes_changes.html into data/raw/")
 
             hero_docs = extract_hero_docs_from_html(html_path)
+            # В блоке обработки героев, после извлечения docs:
+            print(f"  - Found {len(hero_docs)} heroes in HTML")
 
+            # В блоке обработки героев:
             for doc in hero_docs:
-                # режем большой текст героя на чанки по max_chars
-                chunks = _split_long_text(doc.text, max_chars=ch_cfg.max_chars)
-                if not chunks:
-                    continue
+                # Используем специальную функцию чанкинга для героев
+                # chunk_hero_card сохранит героя как один чанк целиком
+                chunks = chunk_hero_card(doc.text)
 
                 for ci, ch in enumerate(chunks):
                     all_texts.append(ch)
 
-                    if category == "heroes":
-                        pointers.append({
-                            "category": "heroes",
-                            "source": "html",
-                            "source_file": html_path.name,
-                            "html_file": html_path.name,
-                            "hero_slug": doc.hero_slug,
-                            "hero_name": doc.hero_name,
-                            "attribute": doc.attribute,
-                            "chunk_index": ci,
-                            "chunker": {
-                                "max_chars": ch_cfg.max_chars,
-                                "overlap_chars": ch_cfg.overlap_chars,
-                                "min_chars": ch_cfg.min_chars,
-                                "chunker_mode": "heroes_html_card",
-                            }
-                        })
-                    else:
-                        pointers.append({
-                            "category": category,
-                            "source_file": pdf_path.name,
-                            "page": page_num,  # Добавляем для PDF-данных
-                            "chunk_index": ci,
-                            "chunker": {
-                                "max_chars": ch_cfg.max_chars,
-                                "overlap_chars": ch_cfg.overlap_chars,
-                                "min_chars": ch_cfg.min_chars,
-                                "chunker_mode": "heroes_by_headers" if category == "heroes" else "default",
-                            }
-                        })
+                    pointers.append({
+                        "category": "heroes",
+                        "source": "html",
+                        "source_file": html_path.name,
+                        "hero_slug": doc.hero_slug,
+                        "hero_name": doc.hero_name,
+                        "attribute": doc.attribute,
+                        "chunk_index": ci,
+                        "chunker": {
+                            "max_chars": ch_cfg.max_chars,
+                            "overlap_chars": ch_cfg.overlap_chars,
+                            "min_chars": ch_cfg.min_chars,
+                            "chunker_mode": "heroes_full_card",
+                        }
+                    })
 
             # ВАЖНО: не обрабатываем heroes PDF ниже
             continue
-        # --- конец HEROES HTML ---
 
         for page_obj in extract_pages_from_pdf(pdf_path):
             page_num = page_obj["page"]

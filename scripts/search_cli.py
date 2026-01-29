@@ -9,10 +9,9 @@ from typing import Any, Dict, List
 import numpy as np
 
 from src.ingest.pdf_ingest import extract_pages_from_pdf
-from src.chunking.chunker import ChunkerConfig, chunk_text, chunk_heroes_by_headers
+from src.chunking.chunker import ChunkerConfig, chunk_text
 from src.embed.embedder import Embedder, EmbedderConfig
 from src.ingest.heroes_html_ingest import extract_hero_docs_from_html
-from src.chunking.chunker import _split_long_text
 
 RAW_DIR = Path("data/raw")
 INDEX_DIR = Path("index")
@@ -28,7 +27,16 @@ def _get_hero_docs():
     if _HERO_DOCS_CACHE is None:
         from pathlib import Path
         html_path = Path("data/raw/heroes_changes.html")
-        _HERO_DOCS_CACHE = {d.hero_slug: d for d in extract_hero_docs_from_html(html_path)}
+        # Временно перенаправляем stdout чтобы не видеть отладочный вывод
+        import sys
+        from io import StringIO
+        old_stdout = sys.stdout
+        sys.stdout = StringIO()
+
+        try:
+            _HERO_DOCS_CACHE = {d.hero_slug: d for d in extract_hero_docs_from_html(html_path)}
+        finally:
+            sys.stdout = old_stdout
     return _HERO_DOCS_CACHE
 
 
@@ -110,47 +118,58 @@ def main() -> None:
         score = float(scores[i])
 
         pdf_name = p["source_file"]
-
-        # Проверяем, есть ли ключ "page" для героев
-        if "page" in p:
-            page_num = int(p["page"])
-        else:
-            page_num = None  # Для героев из HTML, page_num не существует
-
         chunk_index = int(p["chunk_index"])
 
-        ch = p.get("chunker", {})
-        ch_cfg = ChunkerConfig(
-            max_chars=int(ch.get("max_chars", 1200)),
-            overlap_chars=int(ch.get("overlap_chars", 200)),
-            min_chars=int(ch.get("min_chars", 30)),
-        )
+        # Инициализируем переменную для текста чанка
+        chunk_text_value = ""
 
         if p.get("category") == "heroes" and p.get("source") == "html":
-            hero_docs = _get_hero_docs()  # Функция, которая возвращает загруженные герои из кэша
+            hero_docs = _get_hero_docs()
             doc = hero_docs.get(p.get("hero_slug"))
             if doc is None:
                 chunk_text_value = "[hero not found in html]"
             else:
-                chunks = _split_long_text(doc.text, max_chars=ch_cfg.max_chars)
-                ci = int(p.get("chunk_index", 0))
-                chunk_text_value = chunks[ci] if 0 <= ci < len(chunks) else "[chunk not found]"
+                # Для героев используем chunk_hero_card для получения чанков
+                from src.chunking.chunker import chunk_hero_card
+                chunks = chunk_hero_card(doc.text)
+                chunk_index = p.get("chunk_index", 0)
+
+                if 0 <= chunk_index < len(chunks):
+                    chunk_text_value = chunks[chunk_index]
+                else:
+                    chunk_text_value = f"[chunk not found for hero: {doc.hero_name}]"
         else:
             # старый путь (PDF)
-            if page_num is not None:  # Проверяем, что page_num существует для PDF
+            if "page" in p:
+                page_num = p["page"]
                 page_text = get_page_text(pdf_name, page_num)
+
+                ch = p.get("chunker", {})
+                ch_cfg = ChunkerConfig(
+                    max_chars=int(ch.get("max_chars", 1200)),
+                    overlap_chars=int(ch.get("overlap_chars", 200)),
+                    min_chars=int(ch.get("min_chars", 30)),
+                )
+
                 chunks = chunk_text(page_text, ch_cfg)
 
-        if 0 <= chunk_index < len(chunks):
-            chunk_text_value = chunks[chunk_index]
-        else:
-            chunk_text_value = f"[chunk not found - chunking mismatch: got {chunk_index}, chunks={len(chunks)}, category={p.get('category')}]"
+                if 0 <= chunk_index < len(chunks):
+                    chunk_text_value = chunks[chunk_index]
+                else:
+                    chunk_text_value = f"[chunk not found - chunking mismatch: got {chunk_index}, chunks={len(chunks)}]"
+            else:
+                chunk_text_value = "[page number not found]"
 
         preview = chunk_text_value.replace("\n", " ")
         if len(preview) > 320:
             preview = preview[:320] + "..."
 
-        print(f"{rank}) score={score:.4f} | {p['category']} | {pdf_name} | page={page_num} | chunk={chunk_index}")
+        # Для красивого вывода информации о странице
+        page_info = ""
+        if "page" in p:
+            page_info = f" | page={p['page']}"
+
+        print(f"{rank}) score={score:.4f} | {p['category']} | {pdf_name}{page_info} | chunk={chunk_index}")
         print(preview)
         print("-" * 100)
 
