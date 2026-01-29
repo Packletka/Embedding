@@ -1,0 +1,58 @@
+# =========================
+# OS / Editors
+# =========================
+.DS_Store
+Thumbs.db
+
+.idea/
+*.iml
+
+.vscode/
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+.venv/
+venv/
+ENV/
+env/
+
+build/
+dist/
+*.egg-info/
+
+.ipynb_checkpoints/
+
+# =========================
+# Project artifacts
+# =========================
+
+data/processed/
+
+scripts/data/
+
+index/
+*.npy
+*.npz
+
+*.log
+logs/
+tmp/
+temp/
+
+.hf_cache/
+huggingface/
+
+# =========================
+# Local config
+# =========================
+.env
+.env.*
