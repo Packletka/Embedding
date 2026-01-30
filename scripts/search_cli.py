@@ -22,6 +22,17 @@ INDEX_DIR = Path("index")
 EMB_PATH = INDEX_DIR / "embeddings.npy"
 PTR_PATH = INDEX_DIR / "pointers.jsonl"
 
+
+
+@lru_cache(maxsize=8)
+def _load_docs_from_html(path_str: str, category: str) -> dict[str, Any]:
+    """
+    Кешируем разбор HTML, чтобы при показе нескольких результатов не перепарсивать файл снова.
+    Возвращает mapping slug -> HtmlDoc.
+    """
+    return {d.slug: d for d in extract_docs_from_html(Path(path_str), category)}
+
+
 _HERO_DOCS_CACHE = None
 
 
@@ -133,13 +144,6 @@ def main() -> None:
                 chunk_text_value = "[html source file not found]"
             else:
                 # Загружаем все документы из HTML и кешируем (как для героев)
-                # Для эффективности можно кешировать per-file
-                from functools import lru_cache
-
-                @lru_cache(maxsize=8)
-                def _load_docs_from_html(path_str: str, category: str):
-                    return {d.slug: d for d in extract_docs_from_html(Path(path_str), category)}
-
                 docs_map = _load_docs_from_html(str(html_path), p.get("category"))
                 doc_slug = p.get("doc_slug")
                 if not doc_slug:
@@ -150,7 +154,7 @@ def main() -> None:
                         chunk_text_value = "[doc not found in html]"
                     else:
                         # Получаем чанки для этого документа и возвращаем нужный индекс
-                        chunks = chunk_hero_card(doc.text) if p.get("category") == "heroes" else chunk_html_doc(
+                        chunks = chunk_html_doc(
                             doc.title, doc.text, ChunkerConfig(
                                 max_chars=int(p.get("chunker", {}).get("max_chars", 1200)),
                                 overlap_chars=int(p.get("chunker", {}).get("overlap_chars", 200)),
