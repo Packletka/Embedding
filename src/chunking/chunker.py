@@ -57,6 +57,38 @@ def _is_hero_header_line(line: str) -> bool:
     return True
 
 
+def split_long_text_by_chars(text: str, max_chars: int, overlap_chars: int) -> List[str]:
+    """
+    Разбивает text на фрагменты длиной <= max_chars с перекрытием overlap_chars.
+    Сохраняет слова целиком (резать по пробелу, если возможно).
+    """
+    if not text:
+        return []
+
+    t = " ".join(text.split())
+    n = len(t)
+    if n <= max_chars:
+        return [t]
+
+    parts = []
+    start = 0
+    while start < n:
+        end = min(start + max_chars, n)
+        # попытка сдвинуть конец к последнему пробел внутри окна
+        if end < n:
+            k = t.rfind(" ", start, end)
+            if k > start:
+                end = k
+        part = t[start:end].strip()
+        if part:
+            parts.append(part)
+        if end == n:
+            break
+        # следующий старт с учётом overlap
+        start = max(0, end - overlap_chars)
+    return parts
+
+
 def _split_long_text(text: str, max_chars: int) -> List[str]:
     """
     Режем длинный блок на подпорции по max_chars, стараясь резать по границе пробела.
@@ -129,6 +161,47 @@ def chunk_heroes_by_headers(page_text: str, max_chars: int = 1200) -> List[str]:
         chunks.extend(_split_long_text(b, max_chars=max_chars))
 
     return chunks
+
+
+# --- новая функция chunk_html_doc ---
+def chunk_html_doc(title: str, text: str, cfg: ChunkerConfig) -> List[str]:
+    """
+    Чанкинг для HTML-документа (одна карточка/секция).
+    - Если текст короткий (<= cfg.max_chars) — возвращаем один чанк (title + текст или только текст).
+    - Если текст длинный — разбиваем на фрагменты и в начало каждого фрагмента добавляем заголовок для контекста.
+    """
+    if not text:
+        return []
+
+    # Нормализуем текст (используем уже существующую функцию)
+    full_text = normalize_for_chunking(text)
+    if not full_text:
+        return []
+
+    # Если текст короткий — вернуть как есть (с заголовком в начале для контекста)
+    if len(full_text) <= cfg.max_chars:
+        # Если заголовок уже присутствует в тексте — не дублируем
+        if title and title.strip() and title.strip() not in full_text.splitlines()[0]:
+            return [f"{title}\n\n{full_text}"]
+        return [full_text]
+
+    # Длинный текст — разбиваем
+    # Используем публичную split_long_text_by_chars (или внутреннюю _split_long_text)
+    fragments = split_long_text_by_chars(full_text, cfg.max_chars, cfg.overlap_chars)
+
+    out: List[str] = []
+    for frag in fragments:
+        frag = frag.strip()
+        if not frag or len(frag) < cfg.min_chars:
+            continue
+        # Добавляем заголовок в начало каждого фрагмента для контекста
+        if title and title.strip():
+            chunk = f"{title}\n\n{frag}"
+        else:
+            chunk = frag
+        out.append(chunk)
+
+    return out
 
 
 @dataclass

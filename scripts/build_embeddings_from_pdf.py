@@ -13,6 +13,9 @@ from src.ingest.heroes_html_ingest import extract_hero_docs_from_html
 from src.chunking.chunker import _split_long_text  # или сделай публичную split-функцию
 from src.chunking.chunker import chunk_hero_card
 
+from src.ingest.html_ingest import extract_docs_from_html, HtmlDoc
+from src.chunking.chunker import chunk_html_doc, split_long_text_by_chars  # chunk_html_doc уже добавлен ранее
+
 RAW_DIR = Path("data/raw")
 INDEX_DIR = Path("index")
 
@@ -54,48 +57,42 @@ def main() -> None:
     pointers: List[Dict[str, Any]] = []
 
     print("[build] extracting -> chunking -> collecting texts ...")
+
     for pdf_path in pdf_files:
         category = CATEGORY_BY_FILENAME[pdf_path.name]
         print(f"  - {pdf_path.name} ({category})")
 
-        # --- HEROES: берём из HTML, а не из PDF ---
-        if category == "heroes":
-            html_path = RAW_DIR / "heroes_changes.html"
-            if not html_path.exists():
-                raise FileNotFoundError(f"Missing {html_path}. Put heroes_changes.html into data/raw/")
+        # --- HTML-first: если есть соответствующий HTML, используем его ---
+        html_name = f"{category}_changes.html"
+        html_path = RAW_DIR / html_name
+        if html_path.exists():
+            print(f"    using HTML source: {html_name}")
+            docs = extract_docs_from_html(html_path, category=category)
+            print(f"    found {len(docs)} docs in HTML")
 
-            hero_docs = extract_hero_docs_from_html(html_path)
-            # В блоке обработки героев, после извлечения docs:
-            print(f"  - Found {len(hero_docs)} heroes in HTML")
-
-            # В блоке обработки героев:
-            for doc in hero_docs:
-                # Используем специальную функцию чанкинга для героев
-                # chunk_hero_card сохранит героя как один чанк целиком
-                chunks = chunk_hero_card(doc.text)
-
+            for doc in docs:
+                # chunk_html_doc возвращает список чанков для одного логического документа
+                chunks = chunk_html_doc(doc.title, doc.text, ch_cfg)
                 for ci, ch in enumerate(chunks):
                     all_texts.append(ch)
-
                     pointers.append({
-                        "category": "heroes",
+                        "category": category,
                         "source": "html",
                         "source_file": html_path.name,
-                        "hero_slug": doc.hero_slug,
-                        "hero_name": doc.hero_name,
-                        "attribute": doc.attribute,
+                        "doc_slug": doc.slug,
+                        "title": doc.title,
                         "chunk_index": ci,
                         "chunker": {
                             "max_chars": ch_cfg.max_chars,
                             "overlap_chars": ch_cfg.overlap_chars,
                             "min_chars": ch_cfg.min_chars,
-                            "chunker_mode": "heroes_full_card",
+                            "chunker_mode": "html_by_containers",
                         }
                     })
-
-            # ВАЖНО: не обрабатываем heroes PDF ниже
+            # не обрабатываем PDF для этой категории
             continue
 
+        # --- fallback: PDF processing (как раньше) ---
         for page_obj in extract_pages_from_pdf(pdf_path):
             page_num = page_obj["page"]
             text = page_obj["text"]
@@ -103,6 +100,7 @@ def main() -> None:
             if len(text) < 30:
                 continue
 
+            # Попытка PDF-чанкинга по заголовкам для героев/предметов уже реализована в chunk_text
             chunks = chunk_text(text, ch_cfg)
 
             if not chunks:
@@ -113,6 +111,7 @@ def main() -> None:
 
                 pointers.append({
                     "category": category,
+                    "source": "pdf",
                     "source_file": pdf_path.name,
                     "page": page_num,
                     "chunk_index": ci,
@@ -120,7 +119,7 @@ def main() -> None:
                         "max_chars": ch_cfg.max_chars,
                         "overlap_chars": ch_cfg.overlap_chars,
                         "min_chars": ch_cfg.min_chars,
-                        "chunker_mode": "heroes_by_headers" if category == "heroes" else "default",
+                        "chunker_mode": "default",
                     }
                 })
 

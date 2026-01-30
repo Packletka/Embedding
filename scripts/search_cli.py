@@ -12,6 +12,9 @@ from src.ingest.pdf_ingest import extract_pages_from_pdf
 from src.chunking.chunker import ChunkerConfig, chunk_text
 from src.embed.embedder import Embedder, EmbedderConfig
 from src.ingest.heroes_html_ingest import extract_hero_docs_from_html
+from src.ingest.html_ingest import extract_docs_from_html, HtmlDoc
+from src.chunking.chunker import chunk_hero_card
+from src.chunking.chunker import chunk_html_doc, split_long_text_by_chars  # chunk_html_doc уже добавлен ранее
 
 RAW_DIR = Path("data/raw")
 INDEX_DIR = Path("index")
@@ -123,21 +126,41 @@ def main() -> None:
         # Инициализируем переменную для текста чанка
         chunk_text_value = ""
 
-        if p.get("category") == "heroes" and p.get("source") == "html":
-            hero_docs = _get_hero_docs()
-            doc = hero_docs.get(p.get("hero_slug"))
-            if doc is None:
-                chunk_text_value = "[hero not found in html]"
+        if p.get("source") == "html":
+            # Универсальная обработка HTML-документов для всех категорий
+            html_path = RAW_DIR / p.get("source_file", "")
+            if not html_path.exists():
+                chunk_text_value = "[html source file not found]"
             else:
-                # Для героев используем chunk_hero_card для получения чанков
-                from src.chunking.chunker import chunk_hero_card
-                chunks = chunk_hero_card(doc.text)
-                chunk_index = p.get("chunk_index", 0)
+                # Загружаем все документы из HTML и кешируем (как для героев)
+                # Для эффективности можно кешировать per-file
+                from functools import lru_cache
 
-                if 0 <= chunk_index < len(chunks):
-                    chunk_text_value = chunks[chunk_index]
+                @lru_cache(maxsize=8)
+                def _load_docs_from_html(path_str: str, category: str):
+                    return {d.slug: d for d in extract_docs_from_html(Path(path_str), category)}
+
+                docs_map = _load_docs_from_html(str(html_path), p.get("category"))
+                doc_slug = p.get("doc_slug")
+                if not doc_slug:
+                    chunk_text_value = "[doc_slug not found in pointer]"
                 else:
-                    chunk_text_value = f"[chunk not found for hero: {doc.hero_name}]"
+                    doc = docs_map.get(doc_slug)
+                    if doc is None:
+                        chunk_text_value = "[doc not found in html]"
+                    else:
+                        # Получаем чанки для этого документа и возвращаем нужный индекс
+                        chunks = chunk_hero_card(doc.text) if p.get("category") == "heroes" else chunk_html_doc(
+                            doc.title, doc.text, ChunkerConfig(
+                                max_chars=int(p.get("chunker", {}).get("max_chars", 1200)),
+                                overlap_chars=int(p.get("chunker", {}).get("overlap_chars", 200)),
+                                min_chars=int(p.get("chunker", {}).get("min_chars", 30)),
+                            ))
+                        chunk_index = int(p.get("chunk_index", 0))
+                        if 0 <= chunk_index < len(chunks):
+                            chunk_text_value = chunks[chunk_index]
+                        else:
+                            chunk_text_value = f"[chunk not found for doc_slug={doc_slug}]"
         else:
             # старый путь (PDF)
             if "page" in p:
