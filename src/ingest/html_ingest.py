@@ -39,7 +39,9 @@ def _slugify(title: str) -> str:
     if not title:
         return ""
     # Normalize unicode
-    t = unicodedata.normalize("NFKD", title)
+    t = unicodedata.normalize("NFC", title)
+    # Remove soft hyphen / zero-width chars that break slugs
+    t = t.replace("\u00ad", "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
     # Lowercase
     t = t.lower()
     # Replace apostrophes and similar with dash
@@ -209,14 +211,24 @@ def _find_hero_icon_url_in_block(hero_block: Tag, hero_slug: str) -> Optional[st
 def _find_hero_block_from_seed(seed: Tag, hero_slug: str) -> Optional[Tag]:
     """
     Находит контейнер одного героя, начиная от seed (иконка героя или ссылка /hero/<slug>).
-    Логика максимально мягкая:
-    - контейнер должен содержать ability icons или заголовки "Способности"/"Аспекты"
-    - контейнер не должен содержать много hero icons/hero links (иначе это общий список)
+
+    Логика мягкая (чтобы не терять случаи типа:
+    - hero имеет только таланты (Jakiro),
+    - hero имеет только базовые изменения (Crystal Maiden),
+    - hero имеет только аспекты (Queen of Pain)).
+
+    Требования к candidate:
+    - не должен быть "общим списком" (много hero icons/hero links),
+    - должен содержать хотя бы один признак "внутри есть изменения" для конкретного героя:
+        * заголовки "Способности"/"Аспекты"/"Таланты" (или английские аналоги),
+        * ability icon (/dota_react/abilities/),
+        * facet icon (/facets/),
+        * bullet lines (div.eSxy...).
     """
     cur = seed.find_parent("div") if isinstance(seed, Tag) else None
     candidate = None
     depth = 0
-    while cur is not None and isinstance(cur, Tag) and depth < 14:
+    while cur is not None and isinstance(cur, Tag) and depth < 16:
         hero_icons_inside = cur.find_all("img", src=lambda s: s and "/dota_react/heroes/" in s)
         hero_links_inside = cur.find_all("a", href=lambda h: h and "/hero/" in h)
 
@@ -224,16 +236,22 @@ def _find_hero_block_from_seed(seed: Tag, hero_slug: str) -> Optional[Tag]:
         if len(hero_icons_inside) > 1 or len(hero_links_inside) > 6:
             break
 
-        has_abilities_header = cur.find(string=lambda t: isinstance(t, str) and t.strip() == "Способности") is not None
-        has_aspects_header = cur.find(string=lambda t: isinstance(t, str) and t.strip() == "Аспекты") is not None
+        has_abilities_header = cur.find(
+            string=lambda t: isinstance(t, str) and t.strip() in ("Способности", "Abilities")) is not None
+        has_aspects_header = cur.find(
+            string=lambda t: isinstance(t, str) and t.strip() in ("Аспекты", "Facets")) is not None
+        has_talents_header = cur.find(
+            string=lambda t: isinstance(t, str) and t.strip() in ("Таланты", "Talents")) is not None
+
         has_ability_icon = cur.find("img", src=lambda s: s and "/dota_react/abilities/" in s) is not None
         has_facet_icon = (cur.find(style=lambda s: s and "/facets/" in s) is not None) or (
                 cur.find("img", src=lambda s: s and "/facets/" in s) is not None
         )
+        has_bullets = cur.find(class_="eSxyZNZqYCF1Y3wTL5PaK") is not None
 
-        if has_ability_icon or has_abilities_header or has_aspects_header or has_facet_icon:
+        if has_ability_icon or has_abilities_header or has_aspects_header or has_facet_icon or has_talents_header or has_bullets:
             candidate = cur
-            # если внутри есть и аспекты и способности — это почти точно нужный блок
+            # если внутри есть аспекты + способности (или ability icon) — это почти точно нужный блок
             if has_aspects_header and (has_abilities_header or has_ability_icon):
                 return cur
 
@@ -247,22 +265,53 @@ def _extract_general_section_docs(soup: BeautifulSoup, path: Path) -> List[HtmlD
     """
     В general_changes.html секции выглядят как повторяющиеся блоки с заголовком div._3WahKl...
     Возвращаем 1 HtmlDoc на секцию (не одну простыню).
-    """
-    root_title = "Общие изменения"
-    page_title_el = soup.find(
-        lambda t: isinstance(t, Tag) and t.name == "div" and (t.get_text(strip=True) or "") == root_title)
-    if page_title_el:
-        root_title = page_title_el.get_text(strip=True)
 
+    Важно: на странице есть и "корневой" заголовок (title страницы), и подкатегория с таким же названием
+    ("Общие изменения"). Поэтому пропускаем именно заголовок страницы (по структуре), а не по тексту.
+    """
     heading_divs = soup.find_all("div", class_=lambda c: c and "_3WahKl" in c)
+    if not heading_divs:
+        return []
+
+    # Page/root title (заголовок страницы). На dota2.com он часто равен "Общие изменения",
+    # но первый heading может быть "Captains Mode", поэтому не берём слепо heading_divs[0].
+    preferred_root_titles = ["Общие изменения", "General Changes"]
+    root_title = ""
+    for cand in preferred_root_titles:
+        if any(((hd.get_text(strip=True) or "").strip() == cand) for hd in heading_divs):
+            root_title = cand
+            break
+    if not root_title:
+        root_title = (heading_divs[0].get_text(strip=True) or "").strip() or "Общие изменения"
+
+    # Пытаемся найти именно заголовок страницы: заголовок с root_title, чей родитель НЕ содержит пунктов eSxy...
+    root_title_el: Tag | None = None
+    for h in heading_divs:
+        t = (h.get_text(strip=True) or "").strip()
+        if t != root_title:
+            continue
+        parent = h.parent if isinstance(h.parent, Tag) else None
+        if parent is None:
+            continue
+        has_lines = bool(parent.find(class_="eSxyZNZqYCF1Y3wTL5PaK"))
+        if not has_lines:
+            root_title_el = h
+            break
+
+    # Fallback: если не нашли по структуре, считаем корневым первый заголовок.
+    if root_title_el is None and heading_divs and (heading_divs[0].get_text(strip=True) or "").strip() == root_title:
+        root_title_el = heading_divs[0]
+
     docs: List[HtmlDoc] = []
     seen_slugs: set[str] = set()
 
     for h in heading_divs:
+        # Skip only the page title element (not all sections with the same text)
+        if root_title_el is not None and h is root_title_el:
+            continue
+
         title = (h.get_text(strip=True) or "").strip()
         if not title:
-            continue
-        if title == root_title:
             continue
         if len(title) > 80:
             continue
@@ -272,7 +321,7 @@ def _extract_general_section_docs(soup: BeautifulSoup, path: Path) -> List[HtmlD
             continue
 
         # Пункты секции (обычно это div.eSxy...)
-        lines = []
+        lines: list[str] = []
         for ln in section.find_all(class_="eSxyZNZqYCF1Y3wTL5PaK"):
             t = (ln.get_text(" ", strip=True) or "").strip()
             t = re.sub(r"\s+", " ", t)
@@ -327,13 +376,16 @@ def _pick_facet_name_from_lines(lines: List[str]) -> Optional[str]:
 def _extract_hero_docs_hierarchical(soup: BeautifulSoup, path: Path) -> List[HtmlDoc]:
     """
     Парсер heroes_changes.html (иерархический):
-    - 0/1 doc на героя (base) — только если есть базовые изменения
-    - docs на способности: <hero>__ability__<ability>
-    - docs на аспекты: <hero>__facet__<facet>
 
-    Важно:
-    - ability/facet docs обязательно содержат 'Hero: <name>' в тексте
-    - поиск hero seeds делаем по ИКОНКАМ и по ССЫЛКАМ /hero/<slug> (чтобы не терять героев типа Pudge)
+    Возвращает документы 4 типов:
+    - hero-aggregated doc: <hero_slug> (включает ВСЕ изменения героя: base + facets + abilities + talents)
+    - ability docs: <hero>__ability__<ability>
+    - facet docs: <hero>__facet__<facet>
+    - talents doc: <hero>__talents
+
+    Проблемы, которые закрываем:
+    - герой с ONLY Talents (Jakiro) раньше не попадал в pointers.jsonl вообще
+    - герой с ONLY Facets (Queen of Pain) попадал, но без hero-aggregated doc (искать по имени героя было хуже)
     """
     docs: List[HtmlDoc] = []
     seen_doc_slugs: set[str] = set()
@@ -355,6 +407,37 @@ def _extract_hero_docs_hierarchical(soup: BeautifulSoup, path: Path) -> List[Htm
         if hero_slug:
             seeds.append((hero_slug, a, None))
 
+    def _dedup_lines(lines: List[str]) -> List[str]:
+        seen = set()
+        out = []
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln in seen:
+                continue
+            seen.add(ln)
+            out.append(ln)
+        return out
+
+    def _descendant_of(tag: Tag, root: Optional[Tag]) -> bool:
+        if root is None:
+            return False
+        return any(p is root for p in tag.parents)
+
+    def _extract_section_root(hero_block: Tag, header_texts: tuple[str, ...]) -> Optional[Tag]:
+        """Возвращает контейнер секции, который идёт сразу после заголовка (если распознаётся)."""
+        hdr = hero_block.find(string=lambda t: isinstance(t, str) and t.strip() in header_texts)
+        if not hdr:
+            return None
+        hdr_div = hdr.find_parent("div")
+        if not hdr_div or not isinstance(hdr_div, Tag):
+            return None
+        sib = hdr_div.find_next_sibling("div")
+        if sib and isinstance(sib, Tag):
+            return sib
+        return None
+
     for hero_slug, seed_tag, seed_icon_url in seeds:
         if not hero_slug or hero_slug in processed_hero_slugs:
             continue
@@ -368,155 +451,17 @@ def _extract_hero_docs_hierarchical(soup: BeautifulSoup, path: Path) -> List[Htm
         processed_blocks.add(id(hero_block))
 
         hero_name = _find_hero_name(hero_block, hero_slug)
-
         hero_icon_url = seed_icon_url or _find_hero_icon_url_in_block(hero_block, hero_slug)
 
-        # --- Base doc (атрибуты / общие изменения героя) ---
-        base_text = ""
-        base_candidates = hero_block.find_all("div", class_=lambda c: c and "_16viLxUBhU2mCSgOCMsABo" in c)
-        base_section = None
-        for div in base_candidates:
-            # исключаем куски, где есть ability icons или заголовки секций
-            if div.find("img", src=lambda s: s and "/dota_react/abilities/" in s):
-                continue
-            if div.find(string=lambda t: isinstance(t, str) and ("Аспекты" in t or "Способности" in t)):
-                continue
-            if div.find(class_="eSxyZNZqYCF1Y3wTL5PaK"):
-                base_section = div
-                break
+        # --- определяем корни секций (для исключения из base) ---
+        abilities_root = _extract_section_root(hero_block, ("Способности", "Abilities"))
+        talents_root = _extract_section_root(hero_block, ("Таланты", "Talents"))
+        # facets/aspects root иногда "сложнее", поэтому используем старую эвристику ниже
 
-        if base_section is not None:
-            base_text = _get_text_from_container(base_section)
+        # --- Abilities: собираем как отдельные docs + сохраним для aggregated ---
+        ability_entries: List[tuple[str, str]] = []  # (ability_name, body)
+        ability_docs: List[HtmlDoc] = []
 
-        # fallback: собрать "bullet lines" которые не находятся внутри ability/facet секций
-        if not base_text:
-            bullet_divs = hero_block.find_all(class_="eSxyZNZqYCF1Y3wTL5PaK")
-            base_lines: List[str] = []
-            for bd in bullet_divs:
-                cur = bd
-                skip = False
-                # проверяем родителей до hero_block: если где-то есть ability/facet — не base
-                while cur is not None and isinstance(cur, Tag) and cur is not hero_block:
-                    if cur.find("img", src=lambda s: s and "/dota_react/abilities/" in s):
-                        skip = True
-                        break
-                    if cur.find(style=lambda s: s and "/facets/" in s) or cur.find("img",
-                                                                                   src=lambda s: s and "/facets/" in s):
-                        skip = True
-                        break
-                    cur = cur.parent if isinstance(cur.parent, Tag) else None
-                if skip:
-                    continue
-                line = bd.get_text(" ", strip=True)
-                if line:
-                    base_lines.append(line)
-            # remove duplicates while preserving order
-            seen = set()
-            uniq = []
-            for ln in base_lines:
-                if ln in seen:
-                    continue
-                seen.add(ln)
-                uniq.append(ln)
-            base_text = "\n".join(uniq).strip()
-
-        if base_text:
-            base_doc_text = _normalize_whitespace(f"Hero: {hero_name}\n{base_text}".strip())
-            base_slug = hero_slug
-            if base_slug in seen_doc_slugs:
-                k = 2
-                while f"{base_slug}-{k}" in seen_doc_slugs:
-                    k += 1
-                base_slug = f"{base_slug}-{k}"
-            seen_doc_slugs.add(base_slug)
-
-            docs.append(HtmlDoc(
-                slug=base_slug,
-                title=hero_name,
-                text=base_doc_text,
-                category="heroes",
-                source_file=path.name,
-                icon_url=hero_icon_url,
-                position=len(docs),
-                extra={"entity_type": "hero_base", "entity_name": hero_name, "parent_slug": None, "parent_name": None}
-            ))
-
-        # --- Facets / Aspects ---
-        aspects_header = hero_block.find(string=lambda t: isinstance(t, str) and t.strip() == "Аспекты")
-        if aspects_header:
-            cur = aspects_header.find_parent("div")
-            aspects_section = None
-            depth = 0
-            while cur is not None and isinstance(cur, Tag) and depth < 12:
-                if cur.find(string=lambda t: isinstance(t, str) and t.strip() == "Способности"):
-                    break
-                if cur.find(style=lambda s: s and "/facets/" in s) or cur.find("img",
-                                                                               src=lambda s: s and "/facets/" in s):
-                    aspects_section = cur
-                cur = cur.parent if isinstance(cur.parent, Tag) else None
-                depth += 1
-
-            if aspects_section:
-                facet_icons: List[Tag] = []
-                for el in aspects_section.find_all(True):
-                    style = el.get("style", "") or ""
-                    if "/facets/" in style:
-                        facet_icons.append(el)
-                facet_icons += aspects_section.find_all("img", src=lambda s: s and "/facets/" in s)
-
-                facet_entry_seen: set[int] = set()
-                for icon_el in facet_icons:
-                    cont = icon_el.find_parent("div") if isinstance(icon_el, Tag) else None
-                    chosen = None
-                    depth = 0
-                    while cont is not None and isinstance(cont, Tag) and depth < 12:
-                        if cont.find(string=lambda t: isinstance(t, str) and t.strip() == "Способности"):
-                            break
-                        txt = _get_text_from_container(cont)
-                        lines = [ln for ln in txt.splitlines() if ln]
-                        has_facet_name = _pick_facet_name_from_lines(lines) is not None
-                        has_rus_line = any(re.search(r"[А-Яа-я]", ln) and len(ln) > 15 for ln in lines)
-                        if has_facet_name and has_rus_line:
-                            chosen = cont
-                            break
-                        cont = cont.parent if isinstance(cont.parent, Tag) else None
-                        depth += 1
-
-                    if chosen is None:
-                        continue
-                    if id(chosen) in facet_entry_seen:
-                        continue
-                    facet_entry_seen.add(id(chosen))
-
-                    txt = _get_text_from_container(chosen)
-                    lines = [ln for ln in txt.splitlines() if ln]
-                    facet_name = _pick_facet_name_from_lines(lines)
-                    if not facet_name:
-                        continue
-
-                    facet_slug = f"{hero_slug}__facet__{_slugify(facet_name)}"
-                    if facet_slug in seen_doc_slugs:
-                        k = 2
-                        while f"{facet_slug}-{k}" in seen_doc_slugs:
-                            k += 1
-                        facet_slug = f"{facet_slug}-{k}"
-                    seen_doc_slugs.add(facet_slug)
-
-                    facet_text = _normalize_whitespace(f"Hero: {hero_name}\nFacet: {facet_name}\n{txt}")
-
-                    docs.append(HtmlDoc(
-                        slug=facet_slug,
-                        title=f"{hero_name} — Facet: {facet_name}",
-                        text=facet_text,
-                        category="heroes",
-                        source_file=path.name,
-                        icon_url=None,
-                        position=len(docs),
-                        extra={"entity_type": "hero_facet", "entity_name": facet_name, "parent_slug": hero_slug,
-                               "parent_name": hero_name}
-                    ))
-
-        # --- Abilities ---
         ability_imgs = hero_block.find_all("img", src=lambda s: s and "/dota_react/abilities/" in s)
         ability_seen: set[int] = set()
         for aimg in ability_imgs:
@@ -524,7 +469,6 @@ def _extract_hero_docs_hierarchical(soup: BeautifulSoup, path: Path) -> List[Htm
             chosen = None
             depth = 0
             while cont is not None and isinstance(cont, Tag) and depth < 14:
-                # поднимаемся от иконки способности вверх до блока героя и ищем минимальный контейнер с текстом изменений
                 if cont is hero_block:
                     break
                 if cont.find(class_="eSxyZNZqYCF1Y3wTL5PaK") is not None:
@@ -554,10 +498,10 @@ def _extract_hero_docs_hierarchical(soup: BeautifulSoup, path: Path) -> List[Htm
 
             if ability_name.lower() in _STOPWORDS_FACET:
                 continue
-
-            # не индексируем "пустые" ability-карточки
             if not body:
                 continue
+
+            ability_entries.append((ability_name, body))
 
             ability_slug = f"{hero_slug}__ability__{_slugify(ability_name)}"
             if ability_slug in seen_doc_slugs:
@@ -569,17 +513,231 @@ def _extract_hero_docs_hierarchical(soup: BeautifulSoup, path: Path) -> List[Htm
 
             final_text = _normalize_whitespace(f"Hero: {hero_name}\nAbility: {ability_name}\n{body}")
 
-            docs.append(HtmlDoc(
+            ability_docs.append(HtmlDoc(
                 slug=ability_slug,
                 title=f"{hero_name} — {ability_name}",
                 text=final_text,
                 category="heroes",
                 source_file=path.name,
                 icon_url=_get_img_src(aimg) or None,
-                position=len(docs),
+                position=-1,
                 extra={"entity_type": "hero_ability", "entity_name": ability_name, "parent_slug": hero_slug,
                        "parent_name": hero_name}
             ))
+
+        # --- Facets / Aspects: отдельные docs + aggregated ---
+        facet_entries: List[tuple[str, List[str]]] = []  # (facet_name, change_lines)
+        facet_docs: List[HtmlDoc] = []
+        aspects_section = None
+
+        aspects_header = hero_block.find(string=lambda t: isinstance(t, str) and t.strip() in ("Аспекты", "Facets"))
+        if aspects_header:
+            cur = aspects_header.find_parent("div")
+            depth = 0
+            while cur is not None and isinstance(cur, Tag) and depth < 12:
+                if cur.find(string=lambda t: isinstance(t, str) and t.strip() in ("Способности", "Abilities")):
+                    break
+                if cur.find(style=lambda s: s and "/facets/" in s) or cur.find("img",
+                                                                               src=lambda s: s and "/facets/" in s):
+                    aspects_section = cur
+                cur = cur.parent if isinstance(cur.parent, Tag) else None
+                depth += 1
+
+        if aspects_section:
+            facet_icons: List[Tag] = []
+            for el in aspects_section.find_all(True):
+                style = el.get("style", "") or ""
+                if "/facets/" in style:
+                    facet_icons.append(el)
+            facet_icons += aspects_section.find_all("img", src=lambda s: s and "/facets/" in s)
+
+            facet_entry_seen: set[int] = set()
+            for icon_el in facet_icons:
+                cont = icon_el.find_parent("div") if isinstance(icon_el, Tag) else None
+                chosen = None
+                depth = 0
+                while cont is not None and isinstance(cont, Tag) and depth < 12:
+                    if cont.find(string=lambda t: isinstance(t, str) and t.strip() in ("Способности", "Abilities")):
+                        break
+                    txt = _get_text_from_container(cont)
+                    lines = [ln for ln in txt.splitlines() if ln]
+                    has_facet_name = _pick_facet_name_from_lines(lines) is not None
+                    has_rus_line = any(re.search(r"[А-Яа-я]", ln) and len(ln) > 10 for ln in lines)
+                    if has_facet_name and has_rus_line:
+                        chosen = cont
+                        break
+                    cont = cont.parent if isinstance(cont.parent, Tag) else None
+                    depth += 1
+
+                if chosen is None:
+                    continue
+                if id(chosen) in facet_entry_seen:
+                    continue
+                facet_entry_seen.add(id(chosen))
+
+                txt = _get_text_from_container(chosen)
+                lines = [ln for ln in txt.splitlines() if ln]
+                facet_name = _pick_facet_name_from_lines(lines)
+                if not facet_name:
+                    continue
+
+                # вытащим "линии изменений" (без мусора)
+                change_lines = []
+                for ln in lines:
+                    lns = ln.strip()
+                    if not lns:
+                        continue
+                    low = lns.lower()
+                    if low in _STOPWORDS_FACET:
+                        continue
+                    if lns == facet_name:
+                        continue
+                    if lns == hero_name:
+                        continue
+                    # пропускаем явные статусы
+                    if low in (
+                    "новый", "сильно изменён", "сильно изменен", "слабо изменён", "слабо изменен", "изменён", "изменен",
+                    "удалён", "удален"):
+                        continue
+                    # оставляем "содержательные" строки
+                    if re.search(r"[А-Яа-я0-9]", lns) and len(lns) >= 10:
+                        change_lines.append(lns)
+                change_lines = _dedup_lines(change_lines)
+
+                facet_entries.append((facet_name, change_lines))
+
+                facet_slug = f"{hero_slug}__facet__{_slugify(facet_name)}"
+                if facet_slug in seen_doc_slugs:
+                    k = 2
+                    while f"{facet_slug}-{k}" in seen_doc_slugs:
+                        k += 1
+                    facet_slug = f"{facet_slug}-{k}"
+                seen_doc_slugs.add(facet_slug)
+
+                # В тексте facet-doc оставляем исходный txt (он полезен), но добавляем префиксы Hero/Facet
+                facet_text = _normalize_whitespace(f"Hero: {hero_name}\nFacet: {facet_name}\n{txt}")
+
+                facet_docs.append(HtmlDoc(
+                    slug=facet_slug,
+                    title=f"{hero_name} — Facet: {facet_name}",
+                    text=facet_text,
+                    category="heroes",
+                    source_file=path.name,
+                    icon_url=None,
+                    position=-1,
+                    extra={"entity_type": "hero_facet", "entity_name": facet_name, "parent_slug": hero_slug,
+                           "parent_name": hero_name}
+                ))
+
+        # --- Talents ---
+        talents_lines: List[str] = []
+        if talents_root:
+            for bd in talents_root.find_all(class_="eSxyZNZqYCF1Y3wTL5PaK"):
+                line = bd.get_text(" ", strip=True)
+                if line:
+                    talents_lines.append(line)
+        talents_lines = _dedup_lines(talents_lines)
+
+        talents_doc: Optional[HtmlDoc] = None
+        if talents_lines:
+            talents_slug = f"{hero_slug}__talents"
+            if talents_slug in seen_doc_slugs:
+                k = 2
+                while f"{talents_slug}-{k}" in seen_doc_slugs:
+                    k += 1
+                talents_slug = f"{talents_slug}-{k}"
+            seen_doc_slugs.add(talents_slug)
+
+            t_body = "\n".join(talents_lines).strip()
+            t_text = _normalize_whitespace(f"Hero: {hero_name}\nTalents\n{t_body}")
+            talents_doc = HtmlDoc(
+                slug=talents_slug,
+                title=f"{hero_name} — Talents",
+                text=t_text,
+                category="heroes",
+                source_file=path.name,
+                icon_url=None,
+                position=-1,
+                extra={"entity_type": "hero_talents", "entity_name": "talents", "parent_slug": hero_slug,
+                       "parent_name": hero_name}
+            )
+
+        # --- Base lines (исключаем bullets из abilities/facets/talents) ---
+        excluded_roots = [abilities_root, aspects_section, talents_root]
+        bullet_divs = hero_block.find_all(class_="eSxyZNZqYCF1Y3wTL5PaK")
+        base_lines: List[str] = []
+        for bd in bullet_divs:
+            if any(_descendant_of(bd, r) for r in excluded_roots if r is not None):
+                continue
+            line = bd.get_text(" ", strip=True)
+            if line:
+                base_lines.append(line)
+        base_lines = _dedup_lines(base_lines)
+
+        # --- Решение: создавать hero-aggregated doc если есть хоть какие-то изменения ---
+        has_meaningful = bool(base_lines or ability_entries or facet_entries or talents_lines)
+        if not has_meaningful:
+            # пропускаем "пустых" героев, чтобы не засорять индекс
+            continue
+
+        # --- Hero aggregated doc ---
+        agg_lines: List[str] = [f"Hero: {hero_name}"]
+
+        if base_lines:
+            agg_lines.append("Base:")
+            agg_lines += [f"- {ln}" for ln in base_lines]
+
+        if facet_entries:
+            agg_lines.append("Facets:")
+            for fname, flines in facet_entries:
+                if flines:
+                    agg_lines.append(f"- {fname}: " + "; ".join(flines))
+                else:
+                    agg_lines.append(f"- {fname}")
+
+        if ability_entries:
+            agg_lines.append("Abilities:")
+            for aname, abody in ability_entries:
+                # abody уже в \n, сделаем компактный one-liner для aggregate, чтобы не раздувать
+                compact = " ".join([x.strip() for x in abody.splitlines() if x.strip()])
+                agg_lines.append(f"- {aname}: {compact}")
+
+        if talents_lines:
+            agg_lines.append("Talents:")
+            agg_lines += [f"- {ln}" for ln in talents_lines]
+
+        hero_doc_text = _normalize_whitespace("\n".join(agg_lines).strip())
+
+        base_slug = hero_slug
+        if base_slug in seen_doc_slugs:
+            k = 2
+            while f"{base_slug}-{k}" in seen_doc_slugs:
+                k += 1
+            base_slug = f"{base_slug}-{k}"
+        seen_doc_slugs.add(base_slug)
+
+        # add hero doc first, then children docs (so pointer order is stable)
+        docs.append(HtmlDoc(
+            slug=base_slug,
+            title=hero_name,
+            text=hero_doc_text,
+            category="heroes",
+            source_file=path.name,
+            icon_url=hero_icon_url,
+            position=len(docs),
+            extra={"entity_type": "hero", "entity_name": hero_name, "parent_slug": None, "parent_name": None}
+        ))
+
+        # --- append children in stable order: facets, abilities, talents ---
+        for fd in facet_docs:
+            docs.append(fd.__class__(**{**fd.__dict__, "position": len(docs)}))  # type: ignore
+
+        for ad in ability_docs:
+            docs.append(ad.__class__(**{**ad.__dict__, "position": len(docs)}))  # type: ignore
+
+        if talents_doc is not None:
+            # talents doc after abilities; can be before if you want
+            docs.append(talents_doc.__class__(**{**talents_doc.__dict__, "position": len(docs)}))  # type: ignore
 
     return docs
 
